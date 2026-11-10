@@ -1,0 +1,228 @@
+<!DOCTYPE html>
+<html lang="ja">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>AI Chat App</title>
+    <!-- Tailwind CSS for styling -->
+    <script src="https://jsdelivr.net"></script>
+    <style>
+        /* カスタムスクロールバー */
+        ::-webkit-scrollbar { width: 6px; }
+        ::-webkit-scrollbar-track { background: #f1f1f1; }
+        ::-webkit-scrollbar-thumb { background: #cbd5e1; border-radius: 3px; }
+        ::-webkit-scrollbar-thumb:hover { background: #94a3b8; }
+    </style>
+</head>
+<body class="bg-slate-50 text-slate-800 font-sans h-screen flex flex-col">
+
+    <!-- ヘッダー -->
+    <header class="bg-white border-b border-slate-200 py-4 px-6 flex justify-between items-center shadow-xs">
+        <div class="flex items-center space-x-3">
+            <div class="w-3 h-3 bg-emerald-500 rounded-full animate-pulse"></div>
+            <h1 class="text-xl font-bold text-slate-900 tracking-tight">OpenRouter AI Chat</h1>
+        </div>
+        <button id="clear-btn" class="text-xs bg-slate-100 hover:bg-rose-50 hover:text-rose-600 text-slate-500 font-medium py-2 px-3 rounded-lg transition-colors cursor-pointer">
+            会話履歴をクリア
+        </button>
+    </header>
+
+    <!-- チャット表示エリア -->
+    <main id="chat-container" class="flex-1 overflow-y-auto p-4 md:p-6 space-y-4 max-w-4xl w-full mx-auto">
+        <!-- メッセージがここに動的に追加されます -->
+    </main>
+
+    <!-- 入力エリア -->
+    <footer class="bg-white border-t border-slate-200 p-4 shadow-sm">
+        <form id="chat-form" class="max-w-4xl w-full mx-auto flex items-end space-x-2">
+            <textarea id="user-input" rows="1" placeholder="メッセージを入力..." required
+                class="flex-1 resize-none bg-slate-50 border border-slate-200 rounded-xl px-4 py-3 focus:outline-hidden focus:ring-2 focus:ring-emerald-500 focus:bg-white transition-all max-h-32 text-base"></textarea>
+            <button type="submit" id="send-btn" class="bg-emerald-600 hover:bg-emerald-700 text-white font-medium px-5 py-3 rounded-xl transition-all shadow-sm hover:shadow-md cursor-pointer flex items-center justify-center min-w-[70px]">
+                送信
+            </button>
+        </form>
+    </footer>
+
+    <script>
+        // --- 設定情報 ---
+        const CONFIG = {
+            API_PROVIDER: "openai-compatible",
+            DEFAULT_MODEL: "meta-llama/llama-3.1-8b-instruct:free",
+            OPENAI_API_KEY: "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",
+            OPENAI_COMPATIBLE_URL: "https://openrouter.ai"
+        };
+
+        const COOKIE_NAME = "ai_chat_history";
+        const COOKIE_EXPIRY_DAYS = 7;
+
+        const chatContainer = document.getElementById('chat-container');
+        const chatForm = document.getElementById('chat-form');
+        const userInput = document.getElementById('user-input');
+        const sendBtn = document.getElementById('send-btn');
+        const clearBtn = document.getElementById('clear-btn');
+
+        let chatHistory = [];
+
+        // --- クッキー操作ユーティリティ ---
+        function setCookie(name, value, days) {
+            const date = new Date();
+            date.setTime(date.getTime() + (days * 24 * 60 * 60 * 1000));
+            const expires = "; expires=" + date.toUTCString();
+            // 大容量の履歴や特殊文字に対応するため、Base64エンコードして保存
+            const encodedValue = btoa(unescape(encodeURIComponent(JSON.stringify(value))));
+            document.cookie = name + "=" + (encodedValue || "") + expires + "; path=/; SameSite=Strict";
+        }
+
+        function getCookie(name) {
+            const nameEQ = name + "=";
+            const ca = document.cookie.split(';');
+            for (let i = 0; i < ca.length; i++) {
+                let c = ca[i];
+                while (c.charAt(0) == ' ') c = c.substring(1, c.length);
+                if (c.indexOf(nameEQ) == 0) {
+                    try {
+                        const base64Value = c.substring(nameEQ.length, c.length);
+                        return JSON.parse(decodeURIComponent(escape(atob(base64Value))));
+                    } catch (e) {
+                        console.error("Cookie decryption error:", e);
+                        return null;
+                    }
+                }
+            }
+            return null;
+        }
+
+        function eraseCookie(name) {
+            document.cookie = name + '=; Path=/; Expires=Thu, 01 Jan 1970 00:00:01 GMT; SameSite=Strict';
+        }
+
+        // --- UIレンダリング ---
+        function appendMessage(role, content) {
+            const msgDiv = document.createElement('div');
+            msgDiv.className = `flex ${role === 'user' ? 'justify-end' : 'justify-start'} animate-fade-in`;
+
+            const innerDiv = document.createElement('div');
+            innerDiv.className = `max-w-[85%] rounded-2xl px-4 py-3 shadow-2xs whitespace-pre-wrap break-words text-sm md:text-base ${
+                role === 'user' 
+                    ? 'bg-emerald-600 text-white rounded-br-none' 
+                    : 'bg-white text-slate-800 border border-slate-100 rounded-bl-none'
+            }`;
+            innerDiv.textContent = content;
+
+            msgDiv.appendChild(innerDiv);
+            chatContainer.appendChild(msgDiv);
+            chatContainer.scrollTop = chatContainer.scrollHeight;
+        }
+
+        // 初期化：クッキーから履歴を読み込む
+        function init() {
+            const savedHistory = getCookie(COOKIE_NAME);
+            if (savedHistory && Array.isArray(savedHistory)) {
+                chatHistory = savedHistory;
+                chatHistory.forEach(msg => appendMessage(msg.role, msg.content));
+            } else {
+                appendMessage('assistant', 'こんにちは！何かお手伝いできることはありますか？');
+            }
+        }
+
+        // --- API リクエスト ---
+        async function fetchAIResponse(messages) {
+            const response = await fetch(CONFIG.OPENAI_COMPATIBLE_URL, {
+                method: 'POST',
+                headers: {
+                    'Authorization': `Bearer ${CONFIG.OPENAI_API_KEY}`,
+                    'Content-Type': 'application/json'
+                },
+                body: JSON.stringify({
+                    model: CONFIG.DEFAULT_MODEL,
+                    messages: messages
+                })
+            });
+
+            if (!response.ok) {
+                const errorData = await response.json().catch(() => ({}));
+                throw new Error(errorData.error?.message || `HTTP error! status: ${response.status}`);
+            }
+
+            const data = await response.json();
+            return data.choices[0].message.content;
+        }
+
+        // --- イベントリスナー ---
+        chatForm.addEventListener('submit', async (e) => {
+            e.preventDefault();
+            const text = userInput.value.trim();
+            if (!text) return;
+
+            // ユーザーメッセージを追加
+            appendMessage('user', text);
+            chatHistory.push({ role: 'user', content: text });
+            setCookie(COOKIE_NAME, chatHistory, COOKIE_EXPIRY_DAYS);
+            userInput.value = '';
+            userInput.style.height = 'auto';
+
+            // ローディング状態
+            sendBtn.disabled = true;
+            sendBtn.classList.add('opacity-50', 'cursor-not-allowed');
+            
+            // テンポラリのタイピング表示
+            const typingDiv = document.createElement('div');
+            typingDiv.className = 'flex justify-start items-center space-x-1 p-3 bg-white border border-slate-100 rounded-2xl max-w-[100px] shadow-2xs';
+            typingDiv.innerHTML = '<span class="w-2 h-2 bg-slate-400 rounded-full animate-bounce"></span><span class="w-2 h-2 bg-slate-400 rounded-full animate-bounce [animation-delay:0.2s]"></span><span class="w-2 h-2 bg-slate-400 rounded-full animate-bounce [animation-delay:0.4s]"></span>';
+            chatContainer.appendChild(typingDiv);
+            chatContainer.scrollTop = chatContainer.scrollHeight;
+
+            try {
+                // クッキー容量制限(約4KB)を考慮し、直近の10往復程度のみをコンテキストとして送信
+                const apiContext = chatHistory.slice(-20);
+                const aiResponse = await fetchAIResponse(apiContext);
+
+                // タイピング表示を削除してAI応答を追加
+                typingDiv.remove();
+                appendMessage('assistant', aiResponse);
+                
+                chatHistory.push({ role: 'assistant', content: aiResponse });
+                
+                // クッキーのサイズオーバーを防ぐため最大30件まで保存
+                if (chatHistory.length > 30) chatHistory.shift();
+                setCookie(COOKIE_NAME, chatHistory, COOKIE_EXPIRY_DAYS);
+
+            } catch (error) {
+                console.error(error);
+                typingDiv.remove();
+                appendMessage('assistant', `エラーが発生しました: ${error.message}\n設定やAPIキーの有効性を確認してください。`);
+            } finally {
+                sendBtn.disabled = false;
+                sendBtn.classList.remove('opacity-50', 'cursor-not-allowed');
+            }
+        });
+
+        // テキストエリアの自動改行対応
+        userInput.addEventListener('input', function() {
+            this.style.height = 'auto';
+            this.style.height = (this.scrollHeight) + 'x';
+        });
+
+        // Shift+Enterは改行、Enterのみは送信
+        userInput.addEventListener('keydown', function(e) {
+            if (e.key === 'Enter' && !e.shiftKey) {
+                e.preventDefault();
+                chatForm.requestSubmit();
+            }
+        });
+
+        // 履歴クリア
+        clearBtn.addEventListener('click', () => {
+            if (confirm('これまでの会話履歴を削除しますか？')) {
+                eraseCookie(COOKIE_NAME);
+                chatHistory = [];
+                chatContainer.innerHTML = '';
+                appendMessage('assistant', '会話履歴をクリアしました。新しいメッセージをどうぞ！');
+            }
+        });
+
+        // アプリ起動
+        init();
+    </script>
+</body>
+</html>
